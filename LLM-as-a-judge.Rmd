@@ -1,0 +1,448 @@
+---
+title: "LLM-as-a-judge_Iris_07-11-2025"
+output: word_document
+---
+
+# Setup
+```{r, include=FALSE}
+
+if(!requireNamespace("devtools", quietly=TRUE)) {
+  install.packages("devtools")
+}
+
+if(!requireNamespace("ellmer", quietly=TRUE)) {
+  install.packages("ellmer")
+}
+
+
+
+if(!("openapi" %in% rownames(installed.packages()))) {
+  devtools::install_github("zhanghao-njmu/openapi") 
+}
+
+library(openapi)
+library(ellmer)
+
+library(officer)
+library(stringr)
+library(tibble)
+library(dplyr)
+library(purrr)
+library(jsonlite)
+library(glue)
+
+packageVersion('openapi')
+```   
+
+
+
+
+
+# Setup Azure variables and initialize configuration
+
+The list of valid deployments is available at https://wiki.library.ucsf.edu/display/UVKB/API%3A+Models%2C+deployments%2C+and+endpoints+in+UCSF+Versa
+
+The Ellmer documentation at this time overlooks the typical chat arguments in the OpenAI API, such as temperature, max_tokens, etc. Those are passed via the api_args arguments in a list format as shown below. To see what arguments are available, review the Azure [API reference](https://learn.microsoft.com/en-us/azure/ai-services/openai/reference#request-body). From inspecting the Ellmer source code, it does not appear that it overrides model defaults.
+
+
+```{r}
+# Azure OpenAI Variables
+# Change to your API key
+# Azure OpenAI Variables
+API_KEY <- "" #Put your API Key
+RESOURCE_ENDPOINT <- 'https://unified-api.ucsf.edu/general'
+API_VERSION <- "2024-12-01-preview"
+CHAT_DEPLOYMENT_ID <- "o1-2024-12-17"
+
+Sys.setenv(
+  AZURE_OPENAI_API_KEY = API_KEY,
+  AZURE_OPENAI_ENDPOINT = RESOURCE_ENDPOINT,
+  AZURE_OPENAI_API_VERSION = API_VERSION,
+  AZURE_OPENAI_DEPLOYMENT_ID = CHAT_DEPLOYMENT_ID
+)
+
+if (nchar(API_KEY) == 88 ) {
+  message("The API key length is correct, though it doesn't yet validate that you've used the correct key. We need to test it in the next few cells.
+  
+If you successfully imported the key from the .Renviron file, then remove the key from the first code block if you initially pasted it there to protect it.")
+} else {
+  message("Your API key does not have the correct number of characters. Ensure you have copied the entire key before pasting above.")
+}
+
+if (RESOURCE_ENDPOINT == "https://unified-api.ucsf.edu/general" ) {
+  message("\nThe base API endpoint is the correct URL for the production server.")
+} else {
+  message("\nYour endpoint does not match the production server URL. Found this instead: ", endpoint)
+}
+```
+
+```{r}
+file_path_manuscripts = "D:/Research/LLM meta Coreg Cirrosis/git/Generated Manuscripts_PVT"
+
+read_manuscript_sections <- function(file_path_manuscripts) {
+  # Define section headers (ALL CAPS)
+  section_labels <- c("TITLE", "ABSTRACT", "INTRO", "METHODS", "RESULTS", "DISCUSSION", "OTHER")
+  section_pattern <- paste0("^(", paste(section_labels, collapse = "|"), ")\\s*$")  # case-sensitive
+
+  # Helper to process one DOCX file
+  split_docx_into_sections <- function(file_path) {
+    doc_text <- read_docx(file_path) %>%
+      docx_summary() %>%
+      pull(text) %>%
+      str_trim()
+
+    doc_text <- doc_text[doc_text != ""]  # remove empty lines
+
+    # Find section headers exactly
+    section_indices <- which(str_detect(doc_text, section_pattern))
+    if (length(section_indices) == 0) {
+      section_texts <- setNames(as.list(rep(NA_character_, length(section_labels))), section_labels)
+    } else {
+      found_sections <- doc_text[section_indices]
+      keep <- !duplicated(found_sections)
+      section_indices <- section_indices[keep]
+      found_sections <- found_sections[keep]
+
+      section_texts <- vector("list", length(section_labels))
+      names(section_texts) <- section_labels
+
+      for (i in seq_along(section_indices)) {
+        sec <- found_sections[i]
+        start <- section_indices[i] + 1
+        end <- if (i < length(section_indices)) section_indices[i + 1] - 1 else length(doc_text)
+        section_body <- doc_text[start:end]
+        section_texts[[sec]] <- str_trim(paste(section_body, collapse = "\n"))
+      }
+
+      # Fill missing with NA
+      section_texts <- lapply(section_labels, function(label) {
+        section_texts[[label]] %||% NA_character_
+      })
+      names(section_texts) <- section_labels
+    }
+
+    # Prepend file_id
+    file_id <- tools::file_path_sans_ext(basename(file_path))
+    c(file_id = file_id, section_texts)
+  }
+
+  # List .docx files excluding those starting with "~"
+  docx_files <- list.files(
+    file_path_manuscripts,
+    pattern = "^[^~].*\\.docx$",
+    full.names = TRUE
+  )
+
+  manuscript_sections <- lapply(docx_files, split_docx_into_sections)
+  manuscript_df <- bind_rows(manuscript_sections)
+
+  return(manuscript_df)
+}
+
+
+
+manuscripts = read_manuscript_sections(file_path_manuscripts)
+View(manuscripts)
+```
+
+
+
+
+# Prompts
+```{r}
+#  Section-specific PRISMA prompts
+
+checklist_by_section = list(
+  title = c("Item 1 Title: Does the title identify the report as a systematic review/meta-analysis? Elements: 1) Identify the report as a systematic review in the title. 2) Report an informative title that provides key information about the main objective or question the review addresses (e.g. the population(s) and intervention(s) the review addresses). 3) Consider providing additional information in the title, such as the method of analysis used, the designs of included studies, or an indication that the review is an update of an existing review, or a continually updated (“living”) systematic review."),
+  abstract = c("Item 2a Title - Title: Does the abstract section have a title that identifies the report as a systematic review?", 
+               "Item 2b Background - Objectives: Does the abstract section provide an explicit statement of the main objective(s) or question(s) the review addresses?",
+               "Item 2c Methods - Eligibility Criteria: Does the abstract section specify the inclusion and exclusion criteria for the review?",
+               "Item 2d Methods - Information Sources: Does the abstract section specify the information sources (e.g. databases, registers) used to identify studies and the date when each was last searched?",
+               "Item 2e Methods - Risk of Bias: Does the abstract section specify the methods used to assess risk of bias in the included studies?",
+               "Item 2f Methods - Synthesis of Results: Does the abstract section specify the methods used to present and synthesize results?",
+               "Item 2g Results - Included Studies: Does the abstract section give the total number of included studies and participants and summarise relevant characteristics of studies?",
+               "Item 2h Results - Synthesis of Results: Does the abstract section present results for main outcomes, preferably indicating the number of included studies and participants for each. If meta-analysis was done, report the summary estimate and confidence/credible interval. If comparing groups, indicate the direction of the effect (i.e. which group is favoured)?",
+               "Item 2i Discussion - Limitations of Evidence: Does the abstract section provide a brief summary of the limitations of the evidence included in the review (e.g. study risk of bias, inconsistency and imprecision)?",
+               "Item 2j Discussion - Interpretation: Does the abstract section provide a general interpretation of the results and important implications?",
+               "Item 2k Other - Funding: Does the abstract section specify the primary source of funding for the review?",
+               "Item 2l Other - Registration: Does the abstract section provide the register name and registration number?"),
+  intro = c("Item 3 Rationale: Does the intro describe the rationale for the review in the context of existing knowledge? Elements: 1) Describe the current state of knowledge and its uncertainties. 2) Articulate why it is important to do the review. 3) If other systematic reviews addressing the same (or a largely similar) question are available, explain why the current review was considered necessary. If the review is an update or replication of a particular systematic review, indicate this and cite the previous review. 4) If the review examines the effects of interventions, also briefly describe how the intervention(s) examined might work. 5) If there is complexity in the intervention or context of its delivery (or both) (e.g. multi-component interventions, equity considerations), consider presenting a logic model to visually display the hypothesised relationship between intervention components and outcomes.",
+    "Item 4 Objectives: Does the intro provide an explicit statement of the objective(s) or question(s) the review addresses. Elements: 1) Provide an explicit statement of all objective(s) or question(s) the review addresses, expressed in terms of a relevant question formulation framework. 2) If the purpose is to evaluate the effects of interventions, use the Population, Intervention, Comparator, Outcome (PICO) framework or one of its variants, to state the comparisons that will be made."),
+  methods = c("Item 5 Eligibility Criteria: Does the methods section specify the inclusion and exclusion criteria for the review and how studies were grouped for the syntheses. Elements: 1) Specify all study characteristics used to decide whether a study was eligible for inclusion in the review, that is, components described in the PICO framework or one of its variants, and other characteristics, such as eligible study design(s) and setting(s), and minimum duration of follow-up. 2) Specify eligibility criteria with regard to report characteristics, such as year of dissemination, language, and report status (e.g. whether reports, such as unpublished manuscripts and conference abstracts, were eligible for inclusion). 3) Clearly indicate if studies were ineligible because the outcomes of interest were not measured, or ineligible because the results for the outcome of interest were not reported. 4) Specify any groups used in the synthesis (e.g. intervention, outcome and population groups) and link these to the comparisons specified in the objectives (Item 4). 5) Consider providing rationales for any notable restrictions to study eligibility.",
+    "Item 6 Information Sources: Does the methods section specify all databases, registers, websites, organisations, reference lists and other sources searched or consulted to identify studies. Specify the date when each source was last searched or consulted. Elements: 1) Specify the date when each source (e.g. database, register, website, organisation) was last searched or consulted. 2) If bibliographic databases were searched, specify for each database its name (e.g. MEDLINE, CINAHL), the interface or platform through which the database was searched (e.g. Ovid, EBSCOhost), and the dates of coverage (where this information is provided). 3) If study registers, regulatory databases and other online repositories were searched, specify the name of each source and any date restrictions that were applied. 4) If websites, search engines or other online sources were browsed or searched, specify the name and URL of each source. 5) If organisations or manufacturers were contacted to identify studies, specify the name of each source. 6) If individuals were contacted to identify studies, specify the types of individuals contacted (e.g. authors of studies included in the review or researchers with expertise in the area). 7) If reference lists were examined, specify the types of references examined (e.g. references cited in study reports included in the systematic review, or references cited in systematic review reports on the same or similar topic). 8) If cited or citing reference searches (also called backward and forward citation searching) were conducted, specify the bibliographic details of the reports to which citation searching was applied, the citation index or platform used (e.g. Web of Science), and the date the citation searching was done. 9) If journals or conference proceedings were consulted, specify of the names of each source, the dates covered and how they were searched (e.g. handsearching or browsing online).",
+    "Item 7 Search Strategy: Does the methods section present the full search strategies for all databases, registers and websites, including any filters and limits used. Element: 1) Provide the full line by line search strategy as run in each database with a sophisticated interface (such as Ovid), or the sequence of terms that were used to search simpler interfaces, such as search engines or websites. 2) Describe any limits applied to the search strategy (e.g. date or language) and justify these by linking back to the review’s eligibility criteria. 3) If published approaches, including search filters designed to retrieve specific types of records or search strategies from other systematic reviews, were used, cite them. If published approaches were adapted, for example if search filters are amended, note the changes made. 4) If natural language processing or text frequency analysis tools were used to identify or refine keywords, synonyms or subject indexing terms to use in the search strategy, specify the tool(s) used. 5) If a tool was used to automatically translate search strings for one database to another, specify the tool used. 6) If the search strategy was validated, for example by evaluating whether it could identify a set of clearly eligible studies, report the validation process used and specify which studies were included in the validation set. 7) If the search strategy was peer reviewed, report the peer review process used and specify any tool used such as the Peer Review of Electronic Search Strategies (PRESS) checklist. 8) If the search strategy structure adopted was not based on a PICO-style approach, describe the final conceptual structure and any explorations that were undertaken to achieve it.",
+    "Item 8 Selection Process: Does the methods section specify the methods used to decide whether a study met the inclusion criteria of the review, including how many reviewers screened each record and each report retrieved, whether they worked independently, and if applicable, details of automation tools used in the process. Elements: 1) Recommendations for reporting regardless of the selection processes used: 1A) Report how many reviewers screened each record (title/abstract) and each report retrieved, whether multiple reviewers worked independently at each stage of screening or not, and any processes used to resolve disagreements between screeners. 1B) Report any processes used to obtain or confirm relevant information from study investigators. 1C) If abstracts or articles required translation into another language to determine their eligibility, report how these were translated. 2) Recommendations for reporting in systematic reviews using automation tools in the selection process: 2A) Report how automation tools were integrated within the overall study selection process. 2B) If an externally derived machine learning classifier was applied (e.g. Cochrane RCT Classifier), either to eliminate records or to replace a single screener, include a reference or URL to the version used. If the classifier was used to eliminate records before screening, report the number eliminated in the PRISMA flow diagram as ‘Records marked as ineligible by automation tools’. 2C) If an internally derived machine learning classifier was used to assist with the screening process, identify the software/classifier and version, describe how it was used (e.g. to remove records or replace a single screener) and trained (if relevant), and what internal or external validation was done to understand the risk of missed studies or incorrect classifications. 2D) If machine learning algorithms were used to prioritise screening (whereby unscreened records are continually re-ordered based on screening decisions), state the software used and provide details of any screening rules applied. 3) Recommendations for reporting in systematic reviews using crowdsourcing or previous ‘known’ assessments in the selection process: 3A) If crowdsourcing was used to screen records, provide details of the platform used and specify how it was integrated within the overall study selection process. 3B) If datasets of already-screened records were used to eliminate records retrieved by the search from further consideration, briefly describe the derivation of these datasets.",
+    "Item 9 Data Collection Process: Does the methods section specify the methods used to collect data from reports, including how many reviewers collected data from each report, whether they worked independently, any processes for obtaining or confirming data from study investigators, and if applicable, details of automation tools used in the process. Elements: 1) Report how many reviewers collected data from each report, whether multiple reviewers worked independently or not, and any processes used to resolve disagreements between data collectors. 2) Report any processes used to obtain or confirm relevant data from study investigators. 3) If any automation tools were used to collect data, report how the tool was used, how the tool was trained, and what internal or external validation was done to understand the risk of incorrect extractions. 4) If articles required translation into another language to enable data collection, report how these articles were translated. 5) If any software was used to extract data from figures, specify the software used. 6) If any decision rules were used to select data from multiple reports corresponding to a study, and any steps were taken to resolve inconsistencies across reports, report the rules and steps used.",
+  "Item 10a Data Items (outcomes): Does the methods section list and define all outcomes for which data were sought. Specify whether all results that were compatible with each outcome domain in each study were sought (e.g. for all measures, time points, analyses), and if not, the methods used to decide which results to collect. Elements: 1) List and define the outcome domains and time frame of measurement for which data were sought. 2) Specify whether all results that were compatible with each outcome domain in each study were sought, and if not, what process was used to select results within eligible domains. 3) If any changes were made to the inclusion or definition of the outcome domains, or to the importance given to them in the review, specify the changes, along with a rationale. 4) If any changes were made to the processes used to select results within eligible outcome domains, specify the changes, along with a rationale. 5) Consider specifying which outcome domains were considered the most important for interpreting the review’s conclusions and provide rationale for the labelling (e.g. “a recent core outcome set identified the outcomes labelled ‘critical’ as being the most important to patients”).",
+  "Item 10b Data Items (other variables): Does the methods section list and define all other variables for which data were sought (e.g. participant and intervention characteristics, funding sources). Describe any assumptions made about any missing or unclear information. Elements: 1) List and define all other variables for which data were sought (e.g. participant and intervention characteristics, funding sources). 2) Describe any assumptions made about any missing or unclear information from the studies. 3) If a tool was used to inform which data items to collect, cite the tool used.",
+  "Item 11 Study Risk of Bias Assessment: Does the methods section specify the methods used to assess risk of bias in the included studies, including details of the tool(s) used, how many reviewers assessed each study and whether they worked independently, and if applicable, details of automation tools used in the process. Elements: 1) Specify the tool(s) (and version) used to assess risk of bias in the included studies. 2) Specify the methodological domains/components/items of the risk of bias tool(s) used. 3) Report whether an overall risk of bias judgement that summarised across domains/components/items was made, and if so, what rules were used to reach an overall judgement. 4) If any adaptations to an existing tool to assess risk of bias in studies were made, specify the adaptations. 5) If a new risk of bias tool was developed for use in the review, describe the content of the tool and make it publicly accessible. 6) Report how many reviewers assessed risk of bias in each study, whether multiple reviewers worked independently, and any processes used to resolve disagreements between assessors. 7) Report any processes used to obtain or confirm relevant information from study investigators. 8) If an automation tool was used to assess risk of bias, report how the automation tool was used, how the tool was trained, and details on the tool’s performance and internal validation.",
+  "Item 12 Effect Measures: Does the methods section specifyfor each outcome the effect measure(s) (e.g. risk ratio, mean difference) used in the synthesis or presentation of results. Elements: 1) Specify for each outcome (or type of outcome [e.g. binary, continuous]), the effect measure(s) (e.g. risk ratio, mean difference) used in the synthesis or presentation of results. 2) State any thresholds (or ranges) used to interpret the size of effect (e.g. minimally important difference; ranges for no/trivial, small, moderate and large effects) and the rationale for these thresholds. 3) If synthesized results were re-expressed to a different effect measure, report the method used to re-express results (e.g. meta-analysing risk ratios and computing an absolute risk reduction based on an assumed comparator risk). 4) Consider providing justification for the choice of effect measure.",
+  "Item 13a Synthesis Methods (eligibility for synthesis): Does the methods section describe the processes used to decide which studies were eligible for each synthesis (e.g. tabulating the study intervention characteristics and comparing against the planned groups for each synthesis (Item 5)). Element: 1) Describe the processes used to decide which studies were eligible for each synthesis.",
+  "Item 13b Synthesis Methods (preparing for synthesis): Does the methods section describe any methods required to prepare the data for presentation or synthesis, such as handling of missing summary statistics, or data conversions. Element: 1) Report any methods required to prepare the data collected from studies for presentation or synthesis, such as handling of missing summary statistics, or data conversions.",
+  "Item 13c Synthesis Methods (tabulation and graphical methods): Does the methods section describe any methods used to tabulate or visually display results of individual studies and syntheses. Elements: 1) Report chosen tabular structure(s) used to display results of individual studies and syntheses, along with details of the data presented. 2) Report chosen graphical methods used to visually display results of individual studies and syntheses. 3) If studies are ordered or grouped within tables or graphs based on study characteristics (e.g. by size of the study effect, year of publication), consider reporting the basis for the chosen ordering/grouping. 4) If non-standard graphs were used, consider reporting the rationale for selecting the chosen graph.",
+  "Item 13d Synthesis Methods (statistical synthesis methods): Does the methods section describe any methods used to synthesize results and provide a rationale for the choice(s). If meta-analysis was performed, describe the model(s), method(s) to identify the presence and extent of statistical heterogeneity, and software package(s) used. Elements: 1) If statistical synthesis methods were used, reference the software, packages and version numbers used to implement synthesis methods. 2) If it was not possible to conduct a meta-analysis, describe and justify the synthesis methods or summary approach used. 3) If meta-analysis was done, specify: 3A) the meta-analysis model (fixed-effect, fixed-effects or random-effects) and provide rationale for the selected model. 3B) the method used (e.g. Mantel-Haenszel, inverse-variance). 3C) any methods used to identify or quantify statistical heterogeneity (e.g. visual inspection of results, a formal statistical test for heterogeneity, heterogeneity variance (𝜏2), inconsistency (e.g. I2), and prediction intervals). 4) If a random-effects meta-analysis model was used: 4A) specify the between-study (heterogeneity) variance estimator used (e.g. DerSimonian and Laird, restricted maximum likelihood (REML)). 4B) specify the method used to calculate the confidence interval for the summary effect (e.g. Wald-type confidence interval, Hartung-Knapp-SidikJonkman). 4C) consider specifying other details about the methods used, such as the method for calculating confidence limits for the heterogeneity variance. 5) If a Bayesian approach to meta-analysis was used, describe the prior distributions about quantities of interest (e.g. intervention effect being analysed, amount of heterogeneity in results across studies). 6) If multiple effect estimates from a study were included in a meta-analysis, describe the method(s) used to model or account for the statistical dependency (e.g. multivariate meta-analysis, multilevel models or robust variance estimation). 7) If a planned synthesis was not considered possible or appropriate, report this and the reason for that decision.",
+  "Item 13e Synthesis Methods (methods to explore heterogeneity): Does the methods section describe any methods used to explore possible causes of heterogeneity among study results (e.g. subgroup analysis, meta-regression). Elements: 1) If methods were used to explore possible causes of statistical heterogeneity, specify the method used (e.g. subgroup analysis, meta-regression). 2) If subgroup analysis or meta-regression was performed, specify for each: 2A) which factors were explored, levels of those factors, and which direction of effect modification was expected and why (where possible). 2B) whether analyses were conducted using study-level variables (i.e. where each study is included in one subgroup only), within-study contrasts (i.e. where data on subsets of participants within a study are available, allowing the study to be included in more than one subgroup), or some combination of the above. 2C) how subgroup effects were compared (e.g. statistical test for interaction for subgroup analyses). 3) If other methods were used to explore heterogeneity because data were not amenable to meta-analysis of effect estimates (e.g. structuring tables to examine variation in results across studies based on subpopulation), describe the methods used, along with the factors and levels. 4) If any analyses used to explore heterogeneity were not pre-specified, identify them as such.",
+  "Item 13f Synthesis Methods (sensitivity analyses): Does the methods section describe any sensitivity analyses conducted to assess robustness of the synthesized results. Elements: 1) If sensitivity analyses were performed, provide details of each analysis (e.g. removal of studies at high risk of bias, use of an alternative meta-analysis model). 2) If any sensitivity analyses were not pre-specified, identify them as such.",
+  "Item 14 Reporting Bias Assessment: Does the methods section describe any methods used to assess risk of bias due to missing results in a synthesis (arising from reporting biases). Elements: 1) Specify the methods (tool, graphical, statistical or other) used to assess the risk of bias due to missing results in a synthesis (arising from reporting biases). 2) If risk of bias due to missing results was assessed using an existing tool, specify the methodological components/domains/items of the tool, and the process used to reach a judgement of overall risk of bias. 3) If any adaptations to an existing tool to assess risk of bias due to missing results were made, specify the adaptations. 4) If a new tool to assess risk of bias due to missing results was developed for use in the review, describe the content of the tool and make it publicly accessible. 5) Report how many reviewers assessed risk of bias due to missing results in a synthesis, whether multiple reviewers worked independently, and any processes used to resolve disagreements between assessors. 6) Report any processes used to obtain or confirm relevant information from study investigators. 7) If an automation tool was used to assess risk of bias due to missing results, report how the automation tool was used, how the tool was trained, and details on the tool’s performance and internal validation.",
+  "Item 15 Certainty Assessment: Does the methods section describe any methods used to assess certainty (or confidence) in the body of evidence for an outcome. Elements: 1) Specify the tool or system (and version) used to assess certainty (or confidence) in the body of evidence. 2) Report the factors considered (e.g. precision of the effect estimate, consistency of findings across studies) and the criteria used to assess each factor when assessing certainty in the body of evidence. 3) Describe the decision rules used to arrive at an overall judgement of the level of certainty, together with the intended interpretation (or definition) of each level of certainty. 4) If applicable, report any review-specific considerations for assessing certainty, such as thresholds used to assess imprecision and ranges of magnitude of effect that might be considered trivial, moderate or large, and the rationale for these thresholds and ranges (Item 12). 5) If any adaptations to an existing tool or system to assess certainty were made, specify the adaptations. 6) Report how many reviewers assessed certainty in the body of evidence for an outcome, whether multiple reviewers worked independently, and any processes used to resolve disagreements between assessors. 7) Report any processes used to obtain or confirm relevant information from investigators. 8) If an automation tool was used to support the assessment of certainty, report how the automation tool was used, how the tool was trained, and details on the tool’s performance and internal validation. 9) Describe methods for reporting the results of assessments of certainty, such as the use of Summary of Findings tables. 10) If standard phrases that incorporate the certainty of evidence were used (e.g. “hip protectors probably reduce the risk of hip fracture slightly”), report the intended interpretation of each phrase and the reference for the source guidance."),
+  results = c("Item 16a Study Selection (flow of studies): Does the results section describe the results of the search and selection process, from the number of records identified in the search to the number of studies included in the review, ideally using a flow diagram. Elements: 1) Report, ideally using a flow diagram, the number of: records identified; records excluded before screening; records screened; records excluded after screening titles or titles and abstracts; reports retrieved for detailed evaluation; potentially eligible reports that were not retrievable; retrieved reports that did not meet inclusion criteria and the primary reasons for exclusion; and the number of studies and reports included in the review. If applicable, also report the number of ongoing studies and associated reports identified. 2) If the review is an update of a previous review, report results of the search and selection process for the current review and specify the number of studies included in the previous review. 3) If applicable, indicate in the PRISMA flow diagram how many records were excluded by a human and how many by automation tools.",
+    "Item 16b Study Selection (excluded studies): Does the results section cite studies that might appear to meet the inclusion criteria, but which were excluded, and explain why they were excluded. Element: 1) Cite studies that might appear to meet the inclusion criteria, but which were excluded, and explain why they were excluded.",
+    "Item 17 Study Characteristics: Does the results section cite each included study and present its characteristics. Elements: 1) Cite each included study. 2) Present the key characteristics of each study in a table or figure (considering a format that will facilitate comparison of characteristics across the studies). 3) If the review examines the effects of interventions, consider presenting an additional table that summarises the intervention details for each study.",
+    "Item 18 Risk of Bias in Studies: Does the results section present assessments of risk of bias for each included study. Elements: 1) Present tables or figures indicating for each study the risk of bias in each domain/component/item assessed (e.g. blinding of outcome assessors, missing outcome data) and overall study-level risk of bias. 2) Present justification for each risk of bias judgement, for example in the form of relevant quotations from reports of included studies. 3) If assessments of risk of bias were done for specific outcomes or results in each study, consider displaying risk of bias judgements on a forest plot, next to the study results.",
+    "Item 19 Results of Individual Studies: Does the results section, for all outcomes, present, for each study: (a) summary statistics for each group (where appropriate) and (b) an effect estimate and its precision (e.g. confidence/credible interval), ideally using structured tables or plots. Elements: 1) For all outcomes, irrespective of whether statistical synthesis was undertaken, present for each study summary statistics for each group (where appropriate). For dichotomous outcomes, report the number of participants with and without the events for each group; or the number with the event and the total for each group (e.g. 12/45). For continuous outcomes, report the mean, standard deviation and sample size of each group. 2) For all outcomes, irrespective of whether statistical synthesis was undertaken, present for each study an effect estimate and its precision (e.g. standard error or 95% confidence/credible interval). For example, for time-to-event outcomes, present a hazard ratio and its confidence interval. 3) If study-level data is presented visually or reported in the text (or both), also present a tabular display of the results. 4) If results were obtained from multiple data sources (e.g. journal article, study register entry, clinical study report, correspondence with authors), report the source of the data. 5) If applicable, indicate which results were not reported directly and had to be computed or estimated from other information.",
+    "Item 20a Results of Syntheses (characteristics of contributing studies): Does the results section, for each synthesis, briefly summarise the characteristics and risk of bias among contributing studies. Elements: 1) Provide a brief summary of the characteristics and risk of bias among studies contributing to each synthesis (meta-analysis or other). The summary should focus only on study characteristics that help in interpreting the results (especially those that suggest the evidence addresses only a restricted part of the review question, or indirectly addresses the question). 2) Indicate which studies were included in each synthesis (e.g. by listing each study in a forest plot or table or citing studies in the text).",
+    "Item 20b Results of Syntheses (results of statistical syntheses): Does the results section present results of all statistical syntheses conducted. If meta-analysis was done, present for each the summary estimate and its precision (e.g. confidence/credible interval) and measures of statistical heterogeneity. If comparing groups, describe the direction of the effect. Elements: 1) Report results of all statistical syntheses described in the protocol and all syntheses conducted that were not pre-specified. 2) If meta-analysis was conducted, report for each: 2A) the summary estimate and its precision (e.g. standard error or 95% confidence/credible interval) 2B) measures of statistical heterogeneity (e.g. 𝜏2, I2, prediction interval) 3) If other statistical synthesis methods were used (e.g. summarising effect estimates, combining P values), report the synthesized result and a measure of precision (or equivalent information, for example, the number of studies and total sample size). 4) If the statistical synthesis method does not yield an estimate of effect (e.g. as is the case when P values are combined), report the relevant statistics (e.g. P value from the statistical test), along with an interpretation of the result that is consistent with the question addressed by the synthesis method. 5) If comparing groups, describe the direction of effect (e.g. fewer events in the intervention group, or higher pain in the comparator group). 6) If synthesising mean differences, specify for each synthesis, where applicable, the unit of measurement (e.g. kilograms or pounds for weight), the upper and lower limits of the measurement scale (e.g. anchors range from 0 to 10), direction of benefit (e.g. higher scores denote higher severity of pain), and the minimally important difference, if known. If synthesising standardised mean differences, and the effect estimate is being re-expressed to a particular instrument, details of the instrument, as per the mean difference, should be reported.",
+    "Item 20c Results of Syntheses (results of investigations of heterogeneity): Does the results section present results of all investigations of possible causes of heterogeneity among study results. Elements: 1) If investigations of possible causes of heterogeneity were conducted: 1A) present results regardless of the statistical significance, magnitude, or direction of effect modification. 1B) identify the studies contributing to each subgroup. 1C) report results with due consideration to the observational nature of the analysis and risk of confounding due to other factors. 2) If subgroup analysis was conducted: 2A) report for each analysis the exact P value for a test for interaction, as well as, within each subgroup, the summary estimates, their precision (e.g. standard error or 95% confidence/credible interval) and measures of heterogeneity. 2B) consider presenting the estimate for the difference between subgroups and its precision. 3)  If meta-regression was conducted: 3A) report for each analysis the exact P value for the regression coefficient and its precision. 3B) consider presenting a meta-regression scatterplot with the study effect estimates plotted against the potential effect modifier. 4) If informal methods (i.e. those that do not involve a formal statistical test) were used to investigate heterogeneity, describe the results observed.",
+    "Item 20d Results of Syntheses (results of sensitivity analyses): Does the results section present results of all sensitivity analyses conducted to assess the robustness of the synthesized results. Elements: 1) If any sensitivity analyses were conducted: 1A) report the results for each sensitivity analysis. 1B) comment on how robust the main analysis was given the results of all corresponding sensitivity analyses. 1C) consider presenting results in tables that indicate: (i) the summary effect estimate, a measure of precision (and potentially other relevant statistics, for example, I2 statistic) and contributing studies for the original meta-analysis; (ii) the same information for the sensitivity analysis; and (iii) details of the original and sensitivity analysis assumptions. 1D) consider presenting results of sensitivity analyses visually using forest plots.",
+    "Item 21 Reporting Biases: Does the results section present assessments of risk of bias due to missing results (arising from reporting biases) for each synthesis assessed. Elements: 1) Present assessments of risk of bias due to missing results (arising from reporting biases) for each synthesis assessed. 2) If a tool was used to assess risk of bias due to missing results in a synthesis, present responses to questions in the tool, judgements about risk of bias and any information used to support such judgements. 3) If a funnel plot was generated to evaluate small-study effects (one cause of which is reporting biases), present the plot and specify the effect estimate and measure of precision used in the plot. If a contour-enhanced funnel plot was generated, specify the ‘milestones’ of statistical significance that the plotted contour lines represent (P = 0.01, 0.05, 0.1, etc.) 4) If a test for funnel plot asymmetry was used, report the exact P value observed for the test, and potentially other relevant statistics, for example the standardised normal deviate, from which the P value is derived. 5) If any sensitivity analyses seeking to explore the potential impact of missing results on the synthesis were conducted, present results of each analysis (see item #20d), compare them with results of the primary analysis, and report results with due consideration of the limitations of the statistical method. 6) If studies were assessed for selective non-reporting of results by comparing outcomes and analyses pre-specified in study registers, protocols, and statistical analysis plans with results that were available in study reports, consider presenting a matrix (with rows as studies and columns as syntheses) to present the availability of study results. 7) If an assessment of selective non-reporting of results reveals that some studies are missing from the synthesis, consider displaying the studies with missing results underneath a forest plot or including a table with the available study results.",
+    "Item 22 Certainty of Evidence: Does the results section present assessments of certainty (or confidence) in the body of evidence for each outcome assessed. Elements: 1) Report the overall level of certainty (or confidence) in the body of evidence for each important outcome. 2) Provide an explanation of reasons for rating down (or rating up) the certainty of evidence (e.g. in footnotes to an evidence summary table). 3) Communicate certainty in the evidence wherever results are reported (i.e. abstract, evidence summary tables, results, conclusions), using a format appropriate for the section of the review. 4) Consider including evidence summary tables, such as GRADE Summary of Findings tables."),
+  discussion = c("Item 23a Discussion (interpretation): Does the discussion section provide a general interpretation of the results in the context of other evidence. Element: 1) Provide a general interpretation of the results in the context of other evidence.",
+    "Item 23b Discussion (limitations of evidence): Does the discussion section discuss any limitations of the evidence included in the review. Element: 1) Discuss any limitations of the evidence included in the review.",
+    "Item 23c Discussion (limitations of review processes): Does the discussion section discuss any limitations of the review processes used. Element: 1) Discuss any limitations of the review processes used, and comment on the potential impact of each limitation.",
+    "Item 23d Discussion (implications): Does the discussion section discuss implications of the results for practice, policy, and future research. Elements: 1) Discuss implications of the results for practice and policy. 2) Make explicit recommendations for future research."),
+  other = c("Item 24a Registration and Protocol (registration): Does the other section provide registration information for the review, including register name and registration number, or state that the review was not registered.  Element:  1) Provide registration information for the review, including register name and registration number, or state that the review was not registered.",
+    "Item 24b Registration and Protocol (protocol): Does the other section indicate where the review protocol can be accessed, or state that a protocol was not prepared.  Element:  1) Indicate where the review protocol can be accessed (e.g. by providing a citation, DOI or link), or state that a protocol was not prepared.",
+    "Item 24c Registration and Protocol (amendments): Does the other section describe and explain any amendments to information provided at registration or in the protocol. Element: 1) Report details of any amendments to information provided at registration or in the protocol, noting: (a) the amendment itself; (b) the reason for the amendment; and (c) the stage of the review process at which the amendment was implemented.",
+    "Item 25 Support: Does the other section describe sources of financial or non-financial support for the review, and the role of the funders or sponsors in the review. Elements: 1) Describe sources of financial or non-financial support for the review, specifying relevant grant ID numbers for each funder. If no specific financial or nonfinancial support was received, this should be stated. 2) Describe the role of the funders or sponsors (or both) in the review. If funders or sponsors had no role in the review, this should be declared.",
+    "Item 26 Competing Interests: Does the other section declare any competing interests of review authors. Elements: 1) Disclose any of the authors’ relationships or activities that readers could consider pertinent or to have influenced the review. 2) If any authors had competing interests, report how they were managed for particular review processes.",
+    "Item 27 Availability of Data, Code, and Other Materials: Does the other section report which of the following are publicly available and where they can be found: template data collection forms; data extracted from included studies; data used for all analyses; analytic code; any other materials used in the review. Elements: 1) Report which of the following are publicly available: template data collection forms; data extracted from included studies; data used for all analyses; analytic code; any other materials used in the review. 2) If any of the above materials are publicly available, report where they can be found (e.g. provide a link to files deposited in a public repository). 3) If data, analytic code, or other materials will be made available upon request, provide the contact details of the author responsible for sharing the materials and describe the circumstances under which such materials will be shared.")
+)
+
+
+
+
+
+
+
+max_score =length(checklist_by_section$title) + length(checklist_by_section$abstract) + length(checklist_by_section$intro) + length(checklist_by_section$methods) + length(checklist_by_section$results) + length(checklist_by_section$discussion) + length(checklist_by_section$other)
+
+names(checklist_by_section$title) = c("Item 1")
+names(checklist_by_section$abstract) = c("Item 2a", "Item 2b", "Item 2c", "Item 2d", "Item 2e", "Item 2f",
+                                         "Item 2g", "Item 2h", "Item 2i", "Item 2j", "Item 2k", "Item 2l") 
+names(checklist_by_section$intro) = c("Item 3", "Item 4")
+names(checklist_by_section$methods) = c("Item 5", "Item 6", "Item 7", "Item 8", "Item 9", "Item 10a", "Item 10b",
+                                        "Item 11", "Item 12", "Item 13a", "Item 13b", "Item 13c", "Item 13d", 
+                                        "Item 13e", "Item 13f", "Item 14", "Item 15")
+names(checklist_by_section$results) = c("Item 16a", "Item 16b", "Item 17", "Item 18", "Item 19", "Item 20a", 
+                                        "Item 20b", "Item 20c", "Item 20d", "Item 21", "Item 22")
+names(checklist_by_section$discussion) = c("Item 23a", "Item 23b", "Item 23c", "Item 23d")
+names(checklist_by_section$other) = c("Item 24a", "Item 24b", "Item 24c", "Item 25", "Item 26", "Item 27")
+
+
+# Define function to build a section-specific prompt
+make_section_prompt <- function(section_name, checklist_items) {
+  paste0(
+    "You are a systematic reviewer evaluating the '", section_name, "' section of a manuscript using the PRISMA 2020 checklist.\n\n",
+    "Each section has an item and elements of that item that must be satisfied. Here are the checklist items for this section:\n\n",
+    paste(checklist_items, collapse = "\n"), "\n\n",
+    "Return a JSON object where each key is a checklist item (e.g., 'Item 1'), and each value is an object with the following fields:
+- \"manuscript\": the name of the manuscript (e.g., \"o1_mini_reasoning_paper_1\").
+- \"item\": the checklist item identifier (e.g., \"Item 1\").
+- \"score\": a continuous value between 0-1 (inclusive of both 0 and 1). 0 means the section is non-compliant and 1 means the section is compliant with the checklist item and the associated elements.
+- \"rationale\": a concise explanation of the score.
+- \"citation\": a quote or quotes from the section that supports the rationale.
+
+Return only the JSON object, no extra commentary or formatting.\n\n",
+    manuscript_vector[[section_name]]
+  )
+}
+```
+
+
+
+# Loop through manuscript
+```{r}
+manuscript_prisma_df <- list()  # store intermediate results
+
+
+
+
+library(purrr)
+
+# time out error when trying all 13 manuscripts
+# limited to just those on updated prompts
+excluded <- c("o1_mini_reasoning_paper_2", "o1_mini_reasoning_paper_3", "o1_mini_reasoning_paper_4")
+manuscripts2 <- manuscripts[!manuscripts$file_id %in% excluded, ]
+
+
+for (i in seq_len(nrow(manuscripts))) {
+  
+  manuscript_vector <- as.character(manuscripts[i, ])
+  names(manuscript_vector) <- c("manuscript", "title", "abstract", "intro", "methods", "results", "discussion", "other")
+  
+  section_vectors <- lapply(names(manuscript_vector), function(section) {
+    vec <- manuscript_vector[section]
+    names(vec) <- section
+    return(vec)
+  })
+  names(section_vectors) <- names(manuscript_vector)
+
+  section_responses <- list()
+  
+  client <- chat_azure_openai(
+    deployment_id = Sys.getenv("AZURE_OPENAI_DEPLOYMENT_ID"),
+    api_key = Sys.getenv("AZURE_OPENAI_API_KEY"),
+    endpoint = Sys.getenv("AZURE_OPENAI_ENDPOINT"),
+    api_version = Sys.getenv("AZURE_OPENAI_API_VERSION"),
+    echo = FALSE
+  )
+
+  for (section in names(checklist_by_section)) {
+    prompt <- make_section_prompt(section, checklist_by_section[[section]])
+  
+
+    message(glue::glue("Submitting section: {section} for manuscript {manuscript_vector[['manuscript']]}"))
+
+    client$set_turns(list())
+    response_raw <- client$chat(prompt)
+
+    section_responses[[section]] <- tryCatch(
+      fromJSON(response_raw, simplifyVector = FALSE),
+      error = function(e) {
+        message(glue::glue("⚠️ JSON parsing failed for section {section} in manuscript {manuscript_vector[['manuscript']]}: {e$message}"))
+        list()
+      }
+    )
+  }
+
+  combined_df <- map_dfr(names(section_responses), function(section_name) {
+    section_result <- section_responses[[section_name]]
+
+    if (!is.null(section_result) && length(section_result) > 0) {
+      map_dfr(names(section_result), function(item_name) {
+        item <- section_result[[item_name]]
+
+        if (is.list(item) && all(c("item", "score", "rationale", "citation") %in% names(item))) {
+          tibble(
+            section = section_name,
+            checklist_item = item$item,
+            score = item$score,
+            rationale = item$rationale,
+            citation = item$citation
+          )
+        } else {
+          tibble(
+            section = section_name,
+            checklist_item = item_name,
+            score = NA_real_,
+            rationale = NA_character_,
+            citation = NA_character_
+          )
+        }
+      })
+    } else {
+      tibble(
+        section = section_name,
+        checklist_item = NA_character_,
+        score = NA_real_,
+        rationale = NA_character_,
+        citation = NA_character_
+      )
+    }
+  }) %>%
+    mutate(manuscript = manuscript_vector[["manuscript"]]) %>%
+    relocate(manuscript, .before = section)
+
+  manuscript_prisma_df[[i]] <- combined_df
+  message(paste0(i, " is done."))
+}
+
+
+
+# Combine all into one master dataframe
+manuscript_prisma_df <- bind_rows(manuscript_prisma_df)
+
+# Define max score per section
+section_max_scores <- c(
+  title = length(checklist_by_section$title),
+  abstract = length(checklist_by_section$abstract),
+  intro = length(checklist_by_section$intro),
+  methods = length(checklist_by_section$methods),
+  results = length(checklist_by_section$results),
+  discussion = length(checklist_by_section$discussion),
+  other = length(checklist_by_section$other)
+)
+
+manuscript_prisma_df <- manuscript_prisma_df %>%
+  group_by(manuscript) %>%
+  mutate(
+    manuscript_total = sum(score, na.rm = TRUE),
+    manuscript_percentage = round((manuscript_total / max_score)*100, digits = 2),
+    quality_grade = case_when(
+      manuscript_total / max_score >= 0.8 ~ "high",
+      manuscript_total / max_score >= 0.6 ~ "moderate",
+      TRUE ~ "low"
+    )
+  ) %>%
+  group_by(manuscript, section, .add = TRUE) %>%
+  mutate(section_total = sum(score, na.rm = TRUE),
+         section_percentage = round((section_total / section_max_scores[section])*100, 2)
+         ) %>%
+  ungroup() %>%
+  relocate(manuscript_total, manuscript_percentage, quality_grade, section_total, section_percentage, .after = manuscript)
+
+
+
+
+View(manuscript_prisma_df)
+
+
+
+# Load the package
+library(writexl)
+
+# Write to Excel
+# write_xlsx(manuscript_prisma_df, "/Users/iriskim/Desktop/PCORI/Meta_VERSA/LLM_manuscript_eval_results/manuscript_evaluation_output_1.xlsx")
+
+
+
+manuscript_prisma_df %>%
+  distinct(manuscript, manuscript_total, manuscript_percentage, quality_grade, section, section_total, section_percentage) %>%
+  mutate(
+    manuscript_percentage = manuscript_total / max_score
+  )
+
+
+# summary statistics
+
+overall_summary <- manuscript_prisma_df %>%
+  distinct(manuscript, manuscript_total, manuscript_percentage) %>%
+#   filter(!manuscript %in% c("paper_2", "paper_3", "paper_4")) %>% --- papers generated using old prompt
+  summarise(
+    mean_total = mean(manuscript_total, na.rm = TRUE),
+    median_total = median(manuscript_total, na.rm = TRUE),
+    sd_total = sd(manuscript_total, na.rm = TRUE),
+    mean_percentage = mean(manuscript_percentage, na.rm = TRUE),
+    median_percentage = median(manuscript_percentage, na.rm = TRUE),
+    sd_percentage = sd(manuscript_percentage, na.rm = TRUE)
+  )
+
+overall_summary
+
+
+
+
+# summary by section
+
+overall_summary2 <- manuscript_prisma_df %>%
+#   filter(!manuscript %in% c("paper_2", "paper_3", "paper_4")) %>%
+  distinct(section, section_total, section_percentage) %>%
+  group_by(section) %>%
+  summarise(
+    mean_total = mean(section_total, na.rm = TRUE),
+    median_total = median(section_total, na.rm = TRUE),
+    sd_total = sd(section_total, na.rm = TRUE),
+    mean_percentage = mean(section_percentage, na.rm = TRUE),
+    median_percentage = median(section_percentage, na.rm = TRUE),
+    sd_percentage = sd(section_percentage, na.rm = TRUE)
+  )
+
+overall_summary2
+```
+
+# Save output
+```{r}
+write.csv(manuscript_prisma_df, "D:/Research/LLM meta Coreg Cirrosis/git/LLM as a Judge output/manuscript_prisma_df_PVT.csv", row.names = FALSE)
+write.csv(overall_summary, "D:/Research/LLM meta Coreg Cirrosis/git/LLM as a Judge output/overall_summary_PVT.csv", row.names = FALSE)
+write.csv(overall_summary2, "D:/Research/LLM meta Coreg Cirrosis/git/LLM as a Judge output/overall_summary2_PVT.csv", row.names = FALSE)
+```

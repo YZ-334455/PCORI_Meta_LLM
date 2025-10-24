@@ -1,0 +1,151 @@
+---
+title: "meta title and abstract screening"
+output: word_document
+---
+
+### Installation
+Following the documentation on the Ellmer repo [README](https://github.com/tidyverse/ellmer/tree/693ba3f753ee01aba43d438d6243dbd8050d8822?tab=readme-ov-file#installation)
+```{r}
+# Uncomment block to install; comment and restart R after successful installation before proceeding
+
+#install.packages("pak") 
+#pak::pak("tidyverse/ellmer")
+```
+
+### Image analysis library dependency
+
+If you intend to use a model to analyze images, uncomment this to install magick. Restart may be required
+```{r}
+#install.packages("magick")
+```
+
+### New Ellmer package setup
+```{r}
+library(ellmer)
+library(jsonlite)
+packageVersion("ellmer")
+api_key <- ""  # Enter your Mulesoft key between the quotes
+endpoint <- "https://unified-api.ucsf.edu/general" 
+```
+
+### Check the API key length and endpoint
+
+```{r}
+if (nchar(api_key) == 88 ) {
+  message("The API key length is correct, though it doesn't yet validate that you've used the correct key. We need to test it in the next few cells.")
+} else {
+  message("Your API key does not have the correct number of characters. Ensure you have copied the entire key before pasting above.")
+}
+
+if (endpoint == "https://unified-api.ucsf.edu/general" ) {
+  message("\nThe base API endpoint is the correct URL for the production server.")
+} else {
+  message("\nYour endpoint does not match the production server URL. Found this instead: ", endpoint)
+}
+```
+### Importing Data
+```{r}
+library(readxl)
+gpt4o <- read_excel("D:/Research/LLM meta Coreg Cirrosis/Cirrhosis_Anticoagulation/All manual screening.xlsx")
+```
+
+### Setup prompts
+```{r}
+systemprompt <- '' # Enter your screening prompt etween the quotes
+
+```
+
+### Basic chat client setup for Versa Azure
+The list of valid deployments is available at https://wiki.library.ucsf.edu/display/UVKB/API%3A+Models%2C+deployments%2C+and+endpoints+in+UCSF+Versa
+The Ellmer documentation at this time overlooks the typical chat arguments in the OpenAI API, such as temperature, max_tokens, etc. Those are passed via the api_args arguments in a list format as shown below. To see what arguments are available, review the Azure [API reference](https://learn.microsoft.com/en-us/azure/ai-services/openai/reference#request-body). From inspecting the Ellmer source code, it does not appear that it overrides model defaults. ```{r}
+```{r}
+deployment <- "gpt-4o-2024-08-06" # Pick a deployment
+api_version <- "2024-10-21" 
+
+client <- chat_azure_openai(
+  system_prompt = systemprompt, # optional
+  api_key = api_key,  # required
+  endpoint = endpoint,  # required
+  deployment_id = deployment,  # required
+  api_version = api_version,  # required
+  echo = 'none', # required, FALSE or 'none' is required to prevent a run time error because Versa does not support streaming yet
+  api_args = list(temperature=0)  # optional, list(temperature=1, max_tokens=2). 
+)
+client
+```
+
+### Client turns checking method--uncomment if needed
+Inspecting the client will reveal the full history of the conversation.
+
+Note that every interaction with the LLM has prompts which can be categorized as:
+- system: the system prompt
+- user: the user prompt
+- assistant: the model's response to a user prompt
+
+```{r}
+# client
+# class(client)
+```
+
+### Available client methods--uncomment if needed
+
+These methods are all defined in the Ellmer [chat.R code](https://github.com/tidyverse/ellmer/blob/main/R/chat.R)
+
+```{r}
+# ls(client)
+```
+
+### Resetting the turns
+
+As mentioned in the last section, to make a prompt independent of the prior prompts, you can reset the turns, which is cleaner than re-instantiating the client.
+```{r}
+client$set_turns(list())
+client
+```
+# Screening
+```{r}
+# Initialize result list
+results_list <- list()
+
+# Loop over each row of the dataframe
+for (i in 1:nrow(gpt4o)) {
+  # Reset LLM memory
+  client$set_turns(list())
+
+  # Construct prompt
+  chat_text <- paste0("Title= ", gpt4o[i, "title"], " Abstract= ", gpt4o[i, "abstract"], collapse = "")
+
+  # Call LLM
+  output <- client$chat(chat_text)
+
+  # Extract lines from output
+  output_lines <- unlist(strsplit(output, "\n"))
+
+  # Extract decision and reason
+  decision <- trimws(output_lines[1])  # Should be "0" or "1"
+  reason <- trimws(gsub("^Reason of the decision of ruling in or ruling out:\\s*", "", output_lines[2]))
+
+  # Append to list as a named list (safer for rbind later)
+  results_list[[i]] <- list(`LLM decision` = decision, `reason of decision` = reason)
+}
+
+# Convert to dataframe
+results_df <- do.call(rbind.data.frame, results_list)
+
+# View the results
+print(results_df)
+```
+### Token usage
+## Extract token usage from the client
+## Total token usage
+For a comprehensive total, Ellmer provides the following method. If you reset the client during a session, it does appear to retain the historical total. However, if you relaunch R, it resets the token counts to zero (feel free to experiment for yourself).
+```{r}
+token_usage()
+```
+
+
+#### Save Output
+```{r}
+write.csv(results_df_final, "D:/Research/IBD medication trajectory project/Output/7.22.2025/IfStartedUCSF_no13.32.46.csv", row.names = FALSE)
+write.csv(token_usage(), "D:/Research/IBD medication trajectory project/Data/CDW/Note/date from note_token_secondround.csv", row.names = FALSE)
+```
