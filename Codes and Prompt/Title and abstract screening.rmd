@@ -148,4 +148,5 @@ token_usage()
 ```{r}
 write.csv(results_df_final, "D:/Research/IBD medication trajectory project/Output/7.22.2025/IfStartedUCSF_no13.32.46.csv", row.names = FALSE)
 write.csv(token_usage(), "D:/Research/IBD medication trajectory project/Data/CDW/Note/date from note_token_secondround.csv", row.names = FALSE)
+
 ```
